@@ -1,0 +1,315 @@
+# OIS Integration Intelligence: Notion × Fourthwall × YouTube × Discord × OBS
+
+> **Version:** 1.1 — March 4, 2026
+> **Status:** Living document. Built with verified primary and secondary sources.
+> **Intended use:** AI project context, agent instructions, architecture reference, developer onboarding.
+> **Source of truth hierarchy:** Fourthwall owns transactions. Discord owns community presence. OBS owns stream state. YouTube owns content performance. Notion is the ledger — it receives signals from all of them.
+
+---
+
+## Table of Contents
+
+1. [Platform API Surfaces at a Glance](#1-platform-api-surfaces-at-a-glance)
+2. [Low-Hanging Fruit: Integration Chains Ranked by Effort](#2-low-hanging-fruit-integration-chains-ranked-by-effort)
+3. [Clever Solutions from the Community](#3-clever-solutions-from-the-community)
+4. [Gotchas, Silent Failures, and Identity-Linking Challenges](#4-gotchas-silent-failures-and-identity-linking-challenges)
+5. [Notion-Specific: Automations, Agents, and the Markdown API](#5-notion-specific-automations-agents-and-the-markdown-api)
+6. [Fourthwall-Specific: The API Most Creators Don't Know Exists](#6-fourthwall-specific-the-api-most-creators-dont-know-exists)
+7. [OBS WebSocket v5: Bridging Local Events to the Cloud](#7-obs-websocket-v5-bridging-local-events-to-the-cloud)
+8. [Integration Middleware: Choosing the Right Tool Per Chain](#8-integration-middleware-choosing-the-right-tool-per-chain)
+9. [Integration Roadmap](#9-integration-roadmap)
+10. [Watch List: Emerging Infrastructure](#10-watch-list-emerging-infrastructure)
+
+---
+
+## 1. Platform API Surfaces at a Glance
+
+| Platform | Auth model | Base URL / Port | Rate limit | API status |
+|---|---|---|---|---|
+| **Notion** | Bearer token (`ntn_*`) or OAuth 2.0 | `api.notion.com/v1` | 3 req/s per integration | Stable; `Notion-Version: 2025-09-03` required |
+| **Fourthwall** | HTTP Basic (username:password) or OAuth | `api.fourthwall.com/open-api/v1/` | 100 req / 10s rolling window | V1_BETA (open to all creators) |
+| **YouTube Data API v3** | API key (public) or OAuth 2.0 | `googleapis.com/youtube/v3` | **10,000 units/day** per project | Stable; quota cost per endpoint |
+| **Discord** | Bot token / OAuth2 / Webhook URL | `discord.com/api/v10` | 50 req/s global; 5/2s per webhook | Stable; v10 current |
+| **OBS WebSocket v5** | SHA256 challenge-response password | `ws://127.0.0.1:4455` | No rate limit (local) | Bundled in OBS 28+; current OBS 32.0.4 |
+
+### Notion
+
+**Required header on every API call:** `Notion-Version: 2025-09-03`. The 2025-09-03 version introduced multi-source databases — if you are building new integrations now, build to the current model and this is a non-issue. It only matters when inheriting a legacy Zapier/n8n setup built against the old `databases` API.
+
+Key endpoints: `POST /v1/pages` (create database entries), `PATCH /v1/pages/{id}` (update properties), `POST /v1/data_sources/{id}/query` (filter/sort queries), `GET /v1/blocks/{id}/children` (page body). Pagination tops at `page_size=100`, max 100 blocks per append, 3 req/s average with `Retry-After` on 429s.
+
+Notion **cannot receive inbound webhooks** to create or update data natively. External data must enter via direct API calls or middleware. Notion can *send* outbound webhooks via database automations (the "Send webhook" action fires HTTP POST with page property data). Integration API webhooks deliver sparse payloads — entity ID + timestamp only — requiring follow-up calls for content.
+
+### Fourthwall (V1_BETA — open to all creators)
+
+Three distinct APIs: **Platform API** (orders, products, fulfillment, donations, mailing list, webhooks — Basic Auth), **Storefront API** (public-facing, read-only, uses `ptkn_*` tokens), **Memberships API** (membership posts and content). OpenAPI spec: `docs.fourthwall.com/open-api-docs/open-api.yaml`. Any creator with SUPER ADMIN role can generate credentials under Settings → For Developers → Open API.
+
+**15 confirmed webhook event types:** `ORDER_PLACED`, `ORDER_UPDATED`, `GIFT_PURCHASE`, `DONATION`, `PRODUCT_CREATED`, `PRODUCT_UPDATED`, `COLLECTION_UPDATED`, `SUBSCRIPTION_PURCHASED`, `SUBSCRIPTION_CHANGED`, `SUBSCRIPTION_EXPIRED`, `THANK_YOU_SENT`, `NEWSLETTER_SUBSCRIBED`, `PLATFORM_APP_DISCONNECTED`, `GIFT_DRAW_STARTED`, `GIFT_DRAW_ENDED`.
+
+Webhooks use **HMAC-SHA256 signing** via `X-Fourthwall-Hmac-SHA256` header. Client must respond **200 OK within 2000ms** or delivery fails with retries. Test events carry `"testMode": true`.
+
+### YouTube Data API v3
+
+**10,000 units/day** per Google Cloud project, resetting at midnight Pacific. `search.list` costs 100 units (biggest budget threat). `videos.list` and `liveBroadcasts.list` cost 1 unit each. Failed requests still consume quota. The Channel Memberships API (`members.list`, `membershipsLevels.list`) requires an explicit access grant from YouTube.
+
+### Discord (API v10)
+
+Three auth paths: **Bot tokens** for server-to-server, **OAuth2 bearer tokens** for user-delegated actions, **webhook URLs** (token embedded in URL, no header needed). Key endpoint: `PUT /guilds/{id}/members/{user_id}/roles/{role_id}` for role assignment (requires `MANAGE_ROLES`). Webhook execution: `POST /webhooks/{id}/{token}` supporting rich embeds, custom avatars, and thread targeting.
+
+**2025 rate limit change:** All webhooks within a guild may now share the same rate limit bucket (5 requests per 2 seconds), regardless of target channel. At low volume this is unlikely to cause issues, but burst scenarios could trigger throttling. Mitigation: use a single webhook URL with middleware fan-in rather than multiple independent webhooks.
+
+### OBS WebSocket v5
+
+Bundled with OBS Studio since v28 (current: OBS 32.0.4). **v4 → v5 was a complete protocol rewrite** — all event/request names changed, port moved 4444 → 4455, added OpCode-based Hello/Identify/Identified handshake. v4 client libraries are incompatible with v5. Critical event for creator automation: **`StreamStateChanged`** fires with `outputActive` (bool) and `outputState` string. WebSocket server is **local-only** — external services cannot connect without tunneling.
+
+---
+
+## 2. Low-Hanging Fruit: Integration Chains Ranked by Effort
+
+All chains follow the same pattern: **something changes in Platform A → signal fires → Platform B updates, or Notion logs it.** The goal is to eliminate as many legs of that chain as possible.
+
+### Tier 1 — Zero-code, native, deploy today
+
+**Fourthwall → Discord membership roles (native integration)**
+Fourthwall's built-in Discord perk handles the OAuth linking flow. Setup: Dashboard → Memberships → Perks → add "Discord" perk type → connect server → map Scrivener and Keeper tiers to Discord roles. The Fourthwall bot manages assignment and removal automatically. Role removal is automatic on subscription expiry. Limitation: membership-only — does not work for one-time product purchases.
+
+**OBS → Discord stream alerts (StreamNotifier plugin)**
+An OBS Python script that fires Discord webhook messages on stream start/stop with customizable embeds and up to 10 dynamic fields. Install: OBS Tools → Scripts → add StreamNotifier. Requires Python 3.11+ and `pip install discord_webhook`. No middleware, no cloud dependency, works offline. Runs inside OBS via `OBS_FRONTEND_EVENT_STREAMING_STARTED` callback.
+
+**YouTube → Discord upload/live notifications (NotifyMe or Pingcord)**
+Dedicated Discord bots that handle PubSubHubbub subscription management, lease renewal, and rich embed formatting. Free tier, web dashboard setup, typically seconds-to-minutes latency. NotifyMe supports YouTube, Twitch, TikTok, and Kick. Pingcord supports filters by video type (live, Shorts, uploads). No coding, no middleware cost.
+
+### Tier 2 — One middleware step, minimal configuration
+
+**Fourthwall webhooks → Discord order/donation notifications (fw-webhooks.vercel.app)**
+Community-built proxy: input your Discord webhook URL and embed color, receive a forwarding URL to paste into Fourthwall's webhook settings. Zero middleware cost, instant forwarding, transforms Fourthwall JSON payload into a Discord embed. Best for simple order/donation notifications.
+
+**Fourthwall → Notion order logging (Zapier)**
+Zapier is the only major middleware platform with a native Fourthwall app. Use "New Order Placed" trigger (instant) → Notion "Create Database Item" action. Map `data.friendlyId` → Order ID, `data.email` → Email, `data.amounts.total.value` → Total, `data.username` → Supporter Name. Same pattern works for `SUBSCRIPTION_PURCHASED`, `DONATION`, and all 12 Fourthwall trigger types.
+
+**Notion database property change → Discord announcement (Zapier or n8n)**
+Notion's "Updated Database Item" trigger → Discord "Send Channel Message" action. Alternatively, Notion's native "Send webhook" automation action fires on property changes with a JSON payload — but Notion's outbound format doesn't match Discord's embed schema. Cleanest path: Notion automation → webhook → n8n/Make → reformat → Discord webhook.
+
+### Tier 3 — Bridge script + middleware, moderate setup
+
+**OBS StreamStateChanged → Notion stream logging**
+No direct path. Two approaches:
+
+- **Advanced Scene Switcher plugin + curl (no code):** Configure a macro in OBS's Advanced Scene Switcher to execute `curl.exe -X POST https://hook.make.com/URL?action=stream_started` on stream state changes. Make.com/n8n receives the webhook and creates a Notion entry.
+- **obs-websocket-js bridge (~20 lines Node.js):** Connects to `ws://127.0.0.1:4455`, listens for `StreamStateChanged`, POSTs to a Make.com/n8n webhook URL with stream metadata.
+
+**YouTube PubSubHubbub → middleware → Discord + Notion**
+Subscribe to `https://pubsubhubbub.appspot.com/subscribe` with topic `https://www.youtube.com/xml/feeds/videos.xml?channel_id=YOUR_CHANNEL_ID` and callback pointing to an n8n/Pipedream webhook. On notification: parse Atom XML, call `videos.list?id=VIDEO_ID&part=snippet,liveStreamingDetails` (1 unit) to check `snippet.liveBroadcastContent == "live"`, then fan out to Discord webhook and Notion API. Lease expires every ~9.6 days — must re-subscribe proactively.
+
+---
+
+## 3. Clever Solutions from the Community
+
+**Fourthwall order → Discord role for non-members (custom bot `/verify` pattern)**
+The native integration only handles membership tiers, not one-time product purchases. Proven pattern: build a Discord bot with a `/verify` slash command where customers enter their Fourthwall order email. Bot queries `GET /orders?email=...` to validate, then calls `PUT /guilds/{id}/members/{user_id}/roles/{role_id}` to assign a "Customer" role. This is the only reliable solution to identity linking for non-membership purchases.
+
+**Notion Custom Agents as glue logic**
+Custom Agents launched February 24, 2026 — autonomous AI agents that run on triggers (schedule, page created/updated, @mentions). Free through May 3, 2026, then credit-based at $10 per 1,000 credits. Best use: judgment-requiring tasks like monitoring a Stream Log database and auto-generating Discord recap summaries. Not best use: deterministic event routing (webhook → create row → post embed), where agents add latency and cost for no reasoning benefit.
+
+**Streamer.bot as a universal bridge**
+Fourthwall has a direct Streamer.bot integration receiving purchase, donation, and gifting events. Streamer.bot also integrates with OBS WebSocket v5 and can fire webhook actions. Creates an alternative path: Fourthwall → Streamer.bot → OBS scene changes + Discord webhooks + HTTP actions → Notion. Particularly useful for on-stream purchase alerts that simultaneously trigger OBS overlays and log to Notion.
+
+**Node-RED for visual OBS automation**
+The `node-red-contrib-obs-ws` package provides visual flow nodes for OBS WebSocket v5. Combined with Node-RED's built-in HTTP request nodes, this creates a drag-and-drop interface for OBS → external webhook bridges without writing code. Runs locally alongside OBS.
+
+**Notion Markdown API for programmatic content writing**
+⚠️ **Verification required before building against this.** The document that sourced this claims a Markdown API (`GET /v1/pages/{id}/markdown`, `PATCH /v1/pages/{id}/markdown`) was added February 26, 2026, with SDK methods in `@notionhq/client` v5.11.0+. This is specific enough to be real but was not captured in OIS research as of March 4, 2026. Verify against `developers.notion.com/page/changelog` before building any workflow that depends on it.
+
+---
+
+## 4. Gotchas, Silent Failures, and Identity-Linking Challenges
+
+**Fourthwall → Discord identity linking is the hardest problem in this stack.**
+For membership roles, Fourthwall's native integration solves it — members self-authenticate via the Perks tab. For everything else (orders, donations, gifting), there is no automatic mapping between a Fourthwall customer (email/order ID) and a Discord user (snowflake ID). Middleware can post notifications but cannot assign roles without a pre-existing ID lookup. The only production-proven solution is the `/verify` bot command pattern.
+
+**YouTube PubSubHubbub is unreliable for live stream detection.**
+Notifications fire on video publication and metadata updates, but the Atom payload has no field indicating whether the video is a live stream. Delays range from seconds to hours. The hub does not retry reliably if your callback is down. Lease renewal is the subscriber's responsibility. Recommended mitigation: PubSubHubbub for uploads + a `liveBroadcasts.list?broadcastStatus=active&mine=true` poll every 60 seconds as fallback (1,440 units/day, leaving 8,560 units).
+
+**Middleware Notion compatibility with 2025-09-03 API**
+If using Zapier, Make.com, or n8n with existing Notion modules built before late 2025, verify they support `data_source_id` for multi-source databases. Some platforms were still updating their Notion modules in early 2026. Build new integrations against the current model and this is never an issue; audit any inherited automation before trusting it.
+
+**Discord guild-wide webhook rate limit bucket sharing (2025 change)**
+All webhooks in a guild may share the same rate limit bucket (5 req / 2s). If StreamNotifier, a YouTube bot, and a Fourthwall notification webhook all fire simultaneously, they collectively share that budget. Mitigation: use a single webhook URL with middleware fan-in rather than multiple independent webhooks.
+
+**OBS WebSocket is invisible to the internet.**
+Binds to localhost only, uses `ws://` (no TLS), cannot be reached by cloud services. Every OBS → external integration requires a local bridge process. If the bridge crashes, OBS events silently stop propagating. No built-in retry or queue. Recommended: run the bridge as a system service with auto-restart, or use the obspython approach (but use `threading` for HTTP calls — blocking calls freeze OBS UI).
+
+**Fourthwall webhook timeout is aggressive.**
+Endpoint must respond **200 OK within 2,000ms** or delivery fails. If middleware has cold-start latency or Notion API call takes too long, the webhook fails. Mitigation: respond 200 immediately, then process asynchronously. Most cloud middleware handles this correctly. Self-hosted n8n behind a reverse proxy with SSL handshake overhead could exceed 2s on first request.
+
+---
+
+## 5. Notion-Specific: Automations, Agents, and the Markdown API
+
+**Native automation layer** supports three trigger types on databases: Page added, Property edited (with sub-conditions), and Every {frequency} (scheduled). Actions: edit property, add/edit pages in other databases, send notification, send email (Gmail), **send webhook** (HTTP POST, max 5 per automation), send Slack notification, define variables. Automations are database-scoped, cannot chain (automation output cannot trigger another automation), and require paid plans (Free plan gets Slack notifications only).
+
+**The "Send webhook" action** is the key outbound mechanism from Notion. Fires HTTP POST with page property data in JSON — property values only, not page content/body. No authentication headers on the outgoing POST. Page buttons can also fire webhooks but only with static custom headers. This enables: Calendar milestone marked "Complete" → webhook → middleware → Discord announcement.
+
+**Integration webhooks** (developer API, distinct from automation webhooks) push notifications when content changes. Events: `page.created`, `page.content_updated`, `page.property_values.updated`, `page.deleted`, `page.moved`, `comment.created`, `data_source.created`, `data_source.schema_updated`. Payloads are sparse — metadata only. Verification uses `X-Notion-Signature` (HMAC-SHA256). Retry: up to 8 times over ~24 hours.
+
+**Markdown API** — ⚠️ Verify before building. Claimed to allow `GET /v1/pages/{id}/markdown` and `PATCH /v1/pages/{id}/markdown` for reading/writing page content as Enhanced Markdown rather than JSON block arrays. Check `developers.notion.com/page/changelog` to confirm availability before building any workflow that depends on this capability.
+
+**Custom Agents (Notion 3.3, February 24, 2026)** — Free through May 3, 2026. Credit-based after: $10 per 1,000 credits (~30-60 simple runs per 1,000 credits). Available models include Claude Sonnet, Claude Opus 4.6, GPT-5, and Gemini 3 Pro. Best use: judgment-requiring glue logic (stream recap generation, content classification, cross-database synthesis). Not best use: deterministic event routing where a simple webhook → API call chain is more reliable and cheaper.
+
+---
+
+## 6. Fourthwall-Specific: The API Most Creators Don't Know Exists
+
+The Open API is not invite-only. Any SUPER ADMIN can generate credentials under Settings → For Developers. Full documentation: `docs.fourthwall.com`.
+
+**Three-API architecture:**
+- **Platform API** — backend operations (orders, products, fulfillment, webhooks). Basic Auth.
+- **Storefront API** — public-facing product data. Read-only. `ptkn_*` storefront token.
+- **Memberships API** — membership posts and content.
+
+The Platform API's webhook CRUD endpoints let you manage subscriptions programmatically — an n8n workflow can self-register its callback URL.
+
+**Zapier is the privileged middleware partner.** Native Zapier integration with 12 instant triggers and 4 actions. No other major middleware (Make.com, n8n, Pipedream) has a native Fourthwall module — all require generic webhook triggers. Pre-built Zapier templates exist for Fourthwall → Discord orders and Fourthwall → Discord subscriptions.
+
+**Notable ecosystem integrations:** Twitch gifting and Sub Discounts for memberships (up to 80% off), StreamElements merch rotator widget, BookFunnel integration for automated ebook delivery, Streamer.bot direct integration. GitHub org `FourthwallHQ` hosts a Vercel Commerce headless storefront template and example repos.
+
+---
+
+## 7. OBS WebSocket v5: Bridging Local Events to the Cloud
+
+**Recommended client libraries:**
+- `obs-websocket-js` 5.0.7 — Node.js/TypeScript, full type definitions, npm install
+- `obsws-python` — Python ≥3.9, PyPI install, dual ReqClient/EventClient architecture
+
+**Canonical bridge pattern (~20 lines Node.js):**
+
+```javascript
+import OBSWebSocket from 'obs-websocket-js';
+const obs = new OBSWebSocket();
+await obs.connect('ws://127.0.0.1:4455', 'your-password');
+
+obs.on('StreamStateChanged', async ({ outputActive, outputState }) => {
+  if (outputState === 'OBS_WEBSOCKET_OUTPUT_STARTED') {
+    await fetch('https://hook.make.com/YOUR_WEBHOOK', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ event: 'stream_started', ts: new Date().toISOString() })
+    });
+  }
+});
+```
+
+**Three no-code alternatives:**
+- **StreamNotifier** — OBS Python script, direct Discord webhook, customizable embeds, no cloud dependency
+- **Advanced Scene Switcher plugin** — macro → execute `curl.exe` → hit any webhook URL, no coding required
+- **Node-RED + node-red-contrib-obs-ws** — visual flow editor, OBS event nodes connect to HTTP request nodes
+
+**obspython (built-in OBS scripting) tradeoffs:** Runs on the main OBS thread — blocking HTTP calls freeze the UI. Use `threading` module for non-blocking HTTP. Python version must match OBS build architecture (OBS 30+ supports Python 3.11). `obs_frontend_add_event_callback()` receives `OBS_FRONTEND_EVENT_STREAMING_STARTED`, `_STOPPED`, `_RECORDING_STARTED`, etc.
+
+**v5 event subscription model:** Clients declare interest in event categories via bit flags during Identify. Category for stream automation: **Outputs** (StreamStateChanged, RecordStateChanged). High-volume events (InputVolumeMeters, SceneItemTransformChanged) require explicit opt-in.
+
+---
+
+## 8. Integration Middleware: Choosing the Right Tool Per Chain
+
+### Free tier comparison
+
+| Platform | Free allowance | Multi-step workflows | Polling interval | Native Fourthwall |
+|---|---|---|---|---|
+| **Make.com** | 1,000 credits/mo | 2 scenarios | 15 min | ❌ |
+| **Zapier** | 100 tasks/mo | 2-step only | 15 min | ✅ |
+| **n8n self-hosted** | Unlimited | Unlimited | Any | ❌ |
+| **Pipedream** | 100 credits/mo | 3 workflows | — | ❌ |
+
+### Recommended stack for Outside Inn Studios
+
+At ~50-200 orders/month and a few streams per week, estimated total automation events are 200-920/month — fits comfortably within Make.com Core ($9/month) or Zapier Professional ($19.99/month), and is essentially free on n8n self-hosted.
+
+| Chain | Recommended tool | Cost | Notes |
+|---|---|---|---|
+| Fourthwall → Discord membership roles | **Fourthwall native** | $0 | Handles Scrivener/Keeper → Discord role mapping |
+| Fourthwall → Discord order/donation notifications | **fw-webhooks.vercel.app** | $0 | Or Zapier template for richer formatting |
+| Fourthwall → Notion order/membership logging | **Zapier** or **n8n** | $0-$19.99/mo | Zapier for native trigger; n8n for lowest cost |
+| OBS → Discord stream alerts | **StreamNotifier** | $0 | Direct, no cloud dependency |
+| OBS → Notion stream logging | **Advanced Scene Switcher + n8n** | ~$5/mo | curl macro → n8n webhook → Notion API |
+| YouTube → Discord live/upload alerts | **NotifyMe or Pingcord** | $0 | Handles PubSubHubbub internally |
+| YouTube → Notion stream logging | **n8n** | ~$5/mo | PubSubHubbub callback → videos.list → Notion |
+| Notion → Discord announcements | **Notion automation + n8n** | ~$5/mo | Notion "Send webhook" → n8n → Discord webhook |
+
+**Budget-optimized path:** n8n self-hosted on a $5/month VPS handles all middleware chains except the zero-code natives. Total: **~$5/month** for unlimited automation with full code control.
+
+**Lowest-effort path:** Zapier Professional ($19.99/month) for all Fourthwall chains (native triggers), supplemented by StreamNotifier and NotifyMe for zero-code legs. No server management, no bridge scripts beyond StreamNotifier.
+
+---
+
+## 9. Integration Roadmap
+
+### Phase 1 — Zero cost, deploy this week
+
+These require no middleware spend and can be deployed today.
+
+- [ ] Fourthwall native Discord integration → Scrivener and Keeper role assignment
+- [ ] StreamNotifier OBS plugin → Discord go-live alerts
+- [ ] NotifyMe or Pingcord → YouTube upload/live → Discord notifications
+
+### Phase 2 — Notion as system of record (first month)
+
+- [ ] Fourthwall webhooks → Notion Members CRM (new Scrivener/Keeper rows)
+- [ ] Fourthwall webhooks → Notion Orders log (all purchases)
+- [ ] OBS StreamStateChanged → Notion Word Counter On-Stream entries
+- [ ] Notion Calendar [Core] milestone marked Done → Discord announcement
+
+### Phase 3 — Automation + intelligence (April/May)
+
+- [ ] YouTube Analytics weekly pull → Notion stream performance dashboard
+- [ ] Notion Custom Agent → stream recap generation from Stream Log database
+- [ ] OBS celebrations: Fourthwall membership → Streamer.bot → OBS scene switch
+- [ ] PubSubHubbub subscription → live stream detection with liveBroadcasts.list fallback poll
+
+### Unsolved / requires custom build
+
+- Identity linking for non-membership purchases: Discord `/verify` bot command backed by Fourthwall API lookup
+- Automatic patron roll updates: obs-websocket-js `SetInputSettings` call on new Scrivener/Keeper join
+
+---
+
+## 10. Watch List: Emerging Infrastructure
+
+**Notion Workers (pre-alpha — do not build against yet)**
+Notion Workers is Vercel-hosted compute infrastructure that would allow code to run in response to Notion events without a separate server or cloud function. If it ships as described, it eliminates the "Notion cannot receive inbound webhooks" constraint entirely and makes several OBS → Notion chains significantly cleaner — specifically the local bridge script requirement. No timeline confirmed. Monitor `notion.com/releases` for GA announcement. For anyone building toward Notion partnership track, this is the most important infrastructure development to watch in 2026.
+
+**Notion Markdown API (unverified — verify before building)**
+Claimed availability of `GET /v1/pages/{id}/markdown` and `PATCH /v1/pages/{id}/markdown` endpoints. If confirmed, this significantly simplifies programmatic writing to Notion — no more constructing nested JSON block arrays. Would make the ONCE mythology draft → Notion pipeline and the stream recap → Notion pipeline much cleaner. Verify at `developers.notion.com/page/changelog` before building.
+
+---
+
+## Reference: Key Source URLs
+
+| Platform | Primary source |
+|---|---|
+| Notion API | `developers.notion.com/reference` |
+| Notion changelog | `developers.notion.com/page/changelog` |
+| Notion automations | `notion.com/help/database-automations` |
+| Notion webhook actions | `notion.com/help/webhook-actions` |
+| Notion Custom Agents | `notion.com/blog/introducing-custom-agents` |
+| Fourthwall API docs | `docs.fourthwall.com/open-api` |
+| Fourthwall webhook events | `docs.fourthwall.com/platform/webhooks/webhook-event-types` |
+| Fourthwall signature verification | `docs.fourthwall.com/webhooks/signature-verification` |
+| YouTube Data API v3 | `developers.google.com/youtube/v3` |
+| YouTube quota calculator | `developers.google.com/youtube/v3/determine_quota_cost` |
+| YouTube PubSubHubbub | `developers.google.com/youtube/v3/guides/push_notifications` |
+| Discord REST API | `discord.com/developers/docs/reference` |
+| Discord webhook guide | `discord.com/developers/docs/resources/webhook` |
+| OBS WebSocket v5 protocol | `github.com/obsproject/obs-websocket/blob/master/docs/generated/protocol.md` |
+| obs-websocket-js | `github.com/obs-websocket-community-projects/obs-websocket-js` |
+| obsws-python | `pypi.org/project/obsws-python` |
+| StreamNotifier OBS plugin | `github.com/ShadowOkami4/StreamNotifier` |
+| fw-webhooks proxy | `fw-webhooks.vercel.app` |
+| Zapier Fourthwall integration | `zapier.com/apps/fourthwall/integrations` |
+| NotifyMe bot | `notifyme.bot` |
+| PubSubHubbub hub | `pubsubhubbub.appspot.com` |
+
+---
+
+*OIS Integration Intelligence v1.1 — March 4, 2026*
+*Outside Inn Studios, LLC | Built with Claude*
